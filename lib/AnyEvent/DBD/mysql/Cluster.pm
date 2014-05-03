@@ -3,6 +3,8 @@ package AnyEvent::DBD::mysql::Cluster;
 use 5.006;
 use strict;
 use warnings FATAL => 'all';
+use Data::Dumper;
+use List::Util 'shuffle';
 
 =head1 NAME
 
@@ -27,6 +29,7 @@ our $VERSION = '0.01';
         { dsn=> { database=>'dbname', host=> '127.0.0.1', port=>3307 }, master=> 1, user=>'username', password=>'tricky_password'},
         { dsn=> { database=>'dbname', host=> '127.0.0.1', port=>3308 }, master=> 0, user=>'username', password=>'tricky_password'},
       ],
+      node_class => 'AnyEvent::DBD::mysql',
     );
     my $cluster_ok;
 
@@ -58,12 +61,20 @@ our $VERSION = '0.01';
     Every node represented as a hash reference, holding required dsn, user, password keys.
     Every dsn is also a hash, with at least two keys: database, socket. 
     Or, three keys for network connection: database, host, port.
-		Other parameters may be specified, such as mysql_connect_timeout.
-		All dsn keys will be joined before passing them to DBD::mysql, for example:
-			'database=dbname;host=127.0.0.1;port=3306'
+    Other parameters may be specified, such as mysql_connect_timeout.
+    All dsn keys will be joined before passing them to DBD::mysql, for example:
+      'database=dbname;host=127.0.0.1;port=3306'
 
-		Server description may also include boolean 'master' key, specifying if this 
-		node is a master or slave node.
+    Optional integer weight parameter may be passed for a node. The heavier node weight,
+    the more frequently it will be used for query ( by increasing probability of that node
+    to be returned by any(), slave(), or master() calls)
+
+    Server description may also include boolean 'role' key, specifying if this 
+    node is a master or slave node. Default is master.
+
+    node_class
+    Optional class name, used to create database connection. Default is 'AnyEvent::DBD::mysql'
+    node_class may also be redefined on a per node basis.
 
     one_connected => sub { my ($self, $node_number, $db_object) = @_}
       Coderef to be called for every cluster node when connected. 
@@ -83,7 +94,24 @@ our $VERSION = '0.01';
 
 sub new {
   my $class = shift;
-  bless {}, $class;
+  my $self = bless {
+    master_class      => 'AnyEvent::DBD::mysql',
+    slave_class       => 'AnyEvent::DBD::mysql',
+    connected_nodes   => [],
+    master_nodes      => [],
+    slave_nodes       => [],
+    @_,
+  }, $class;
+  for my $srv ( @{$self->{servers}} ) {
+    $self->{expected_servers} ++;
+    my $node_class = $srv->{node_class} // $self->{node_class} // 'AnyEvent::DBD::mysql';
+    $srv->{weight} ||=1;
+    $srv->{role} //= 'master';
+    my $dsn = 'DBI:mysql:'. join( ';', map { join ('=', $_, $srv->{dsn}{$_})} keys %{$srv->{dsn}});
+    my $db; $db = $node_class->new( $dsn, $srv->{user}, $srv->{password});
+    $srv->{db} = $db;
+  }
+  $self;
 }
 
 =head2 connect
@@ -94,6 +122,30 @@ sub new {
   By the nature of AnyEvent::DBD::mysql this call will block untill every node gets conected.
 
 =cut
+
+sub connect{
+  my $self = shift;
+  for my $srv (@{$self->{servers}}) {
+    if ( $srv->{db}->connect) {
+      $self->_db_online($srv);
+    }
+  }
+}
+
+sub _db_online{
+  my ($self, $node) = (shift,shift,shift);
+  $self->_node_insert('connected_nodes', $node);
+  $self->_node_insert($node->{role}.'_nodes', $node);
+  
+}
+
+sub _db_offline{
+}
+
+sub _node_insert{
+  my ($self, $list_name, $node) = (shift, shift, shift);
+  $self->{$list_name} = [ shuffle @{ $self->{$list_name} }, ($node->{db}) x ($node->{weight}//1)];
+}
 
 =head2 disconnect
 
@@ -110,12 +162,21 @@ sub new {
 
 =cut
 
+sub any {
+  my $self=shift;
+  $self->_next_db_object('connected_nodes');
+}
+
 =head2 master
 
   Peek any master node in the cluster
   my $db = $cluster->master;
 
 =cut
+sub master {
+  my $self=shift;
+  $self->_next_db_object('master_nodes');
+}
 
 =head2 slave
 
@@ -123,6 +184,17 @@ sub new {
   my $db = $cluster->slave;
 
 =cut
+sub slave {
+  my $self=shift;
+  $self->_next_db_object('slave_nodes');
+}
+
+sub _next_db_object{
+  my ($self, $list) = (shift, shift);
+  return unless $list && @{$self->{$list}};
+  push @{ $self->{$list} }, ( my $one = shift @{ $self->{$list} } );
+  return $one;
+}
 
 =head2 readonly
   
@@ -130,6 +202,10 @@ sub new {
   my $may_insert = ! $cluster->readonly;
 
 =cut
+sub readonly {
+  my $self = shift;
+  return scalar @{$self->{master_nodes}} ? 0: 1;
+}
 
 =head2 connected
   
@@ -137,6 +213,29 @@ sub new {
   my $cluster_ok = $cluster->connected;
 
 =cut
+
+sub connected {
+  my $self = shift;
+  return scalar @{$self->{connected_nodes}} ? 1: 0;
+}
+
+=head2 nodes
+
+  Return all nodes passed to constructor.
+  NOTICE: This function returns internal structure for each node, where database object itself 
+  can be reached as $node->{db}
+  for my $node ( $cluster->nodes) {
+    $node->{db}->execute('select 1', sub { warn 'select returned'});
+  };
+
+  By the nature of AnyEvent::DBD::mysql this call will block untill every node gets conected.
+
+=cut
+sub nodes {
+  my $self = shift;
+  return @{$self->{servers}};
+}
+
 
 =head1 AUTHOR
 
